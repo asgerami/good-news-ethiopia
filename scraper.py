@@ -17,7 +17,9 @@ import html
 import json
 import logging
 import os
+import re
 import time
+from collections import Counter
 from pathlib import Path
 
 import requests
@@ -37,6 +39,7 @@ GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-flash-lite-latest")
 MAX_MESSAGES_PER_RUN = int(os.environ.get("MAX_MESSAGES_PER_RUN", "20"))
 MAX_SEEN_IDS = 5000
+BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "5"))
 
 STATE_FILE = Path(__file__).parent / "state.json"
 TELEGRAPH_API = "https://api.telegra.ph"
@@ -45,47 +48,83 @@ GEMINI_API = "https://generativelanguage.googleapis.com/v1beta"
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("good-news-bot")
 
-CLASSIFY_SCHEMA = {
+# Signals distilled from real ad posts observed on these channels: classified-ad
+# contact info (phone number + a sell/order call-to-action), spammed repeated links,
+# and Tikvah's own paid-partnership disclosure text. Combining signals (rather than
+# matching on phone numbers or links alone) keeps false positives on real news low.
+AD_PHONE_PATTERN = re.compile(r"(?:\+251|0)(?:9|7)\d{8}")
+AD_CTA_WORDS = ("call me", "ለሽያጭ", "ለመሽጥ", "ለማዘዝ", "ይደውሉ", "ለመግዛት")
+AD_MARKER_PHRASES = ("partnership with tikvah", "በማስታወቂያ ዋጋ", "sponsored")
+
+
+def looks_like_ad(text: str) -> bool:
+    lower = text.lower()
+    if any(phrase in lower for phrase in AD_MARKER_PHRASES):
+        return True
+    if AD_PHONE_PATTERN.search(text) and any(word in lower for word in AD_CTA_WORDS):
+        return True
+    urls = re.findall(r"https?://\S+", text)
+    if urls and max(Counter(urls).values()) >= 3:
+        return True  # same link spammed 3+ times
+    return False
+
+
+BATCH_SCHEMA = {
     "type": "OBJECT",
     "properties": {
-        "is_good_news": {
-            "type": "BOOLEAN",
-            "description": (
-                "True only if the post reports genuinely positive, uplifting news: "
-                "achievements, development projects, humanitarian relief, sports wins, "
-                "cultural milestones, economic good news, acts of kindness, etc. "
-                "False for accidents, deaths, disasters, crime, conflict, or purely "
-                "political content."
-            ),
-        },
-        "is_authentic_and_postable": {
-            "type": "BOOLEAN",
-            "description": (
-                "False if this looks like an advertisement/sponsored post, an "
-                "unverified rumor, pure speculation, or content that cannot be "
-                "responsibly reposted as news."
-            ),
-        },
-        "reason": {
-            "type": "STRING",
-            "description": "One short sentence explaining the classification, for internal logging only.",
-        },
-        "summary_en": {
-            "type": "STRING",
-            "description": "A 1-3 sentence English summary of the news, suitable for a short social media post.",
-        },
-        "full_translation_en": {
-            "type": "STRING",
-            "description": "A complete, faithful English translation of the original post.",
+        "results": {
+            "type": "ARRAY",
+            "description": "One result per input post, in any order — matched back by id.",
+            "items": {
+                "type": "OBJECT",
+                "properties": {
+                    "id": {
+                        "type": "STRING",
+                        "description": "Must exactly match the id given for this post in the input.",
+                    },
+                    "is_good_news": {
+                        "type": "BOOLEAN",
+                        "description": (
+                            "True only if the post reports genuinely positive, uplifting news: "
+                            "achievements, development projects, humanitarian relief, sports wins, "
+                            "cultural milestones, economic good news, acts of kindness, etc. "
+                            "False for accidents, deaths, disasters, crime, conflict, or purely "
+                            "political content."
+                        ),
+                    },
+                    "is_authentic_and_postable": {
+                        "type": "BOOLEAN",
+                        "description": (
+                            "False if this looks like an advertisement/sponsored post, an "
+                            "unverified rumor, pure speculation, or content that cannot be "
+                            "responsibly reposted as news."
+                        ),
+                    },
+                    "reason": {
+                        "type": "STRING",
+                        "description": "One short sentence explaining the classification, for internal logging only.",
+                    },
+                    "summary_en": {
+                        "type": "STRING",
+                        "description": "A 1-3 sentence English summary of the news, suitable for a short social media post.",
+                    },
+                    "full_translation_en": {
+                        "type": "STRING",
+                        "description": "A complete, faithful English translation of the original post.",
+                    },
+                },
+                "required": [
+                    "id",
+                    "is_good_news",
+                    "is_authentic_and_postable",
+                    "reason",
+                    "summary_en",
+                    "full_translation_en",
+                ],
+            },
         },
     },
-    "required": [
-        "is_good_news",
-        "is_authentic_and_postable",
-        "reason",
-        "summary_en",
-        "full_translation_en",
-    ],
+    "required": ["results"],
 }
 
 
@@ -130,29 +169,42 @@ def fetch_source_messages(channel: str) -> list[dict]:
     return messages
 
 
-def classify_and_translate(source_text: str) -> dict:
-    prompt = (
+def classify_and_translate_batch(messages: list[dict]) -> dict[str, dict]:
+    """Classify, translate, and summarize a batch of posts in a single Gemini call.
+
+    Returns a dict mapping each message's id to its result. A post whose id is
+    missing from the response (e.g. the model dropped it) simply won't appear
+    in the returned dict — callers should treat that as "retry next run".
+    """
+    parts = [
         "You help run a 'Good News Ethiopia' Telegram channel that reposts "
         "only genuinely positive news, translated into English, sourced from "
-        "Tikvah's Telegram channels (a trusted Ethiopian news source). "
-        "Given the post below (likely Amharic, possibly mixed with English), "
-        "decide whether it is good news, whether it is safe and authentic to "
-        "repost as-is (not an ad, not an unverified rumor, not speculation), "
-        "translate it completely and accurately into English, and write a "
-        "short English summary.\n\n---\n" + source_text
-    )
+        "Tikvah's Telegram channels (a trusted Ethiopian news source). Below "
+        "are several posts (likely Amharic, possibly mixed with English), each "
+        "labeled with its id. For EVERY post, decide whether it is good news, "
+        "whether it is safe and authentic to repost as-is (not an ad, not an "
+        "unverified rumor, not speculation), translate it completely and "
+        "accurately into English, and write a short English summary. Return "
+        "exactly one result per post in the 'results' array, each carrying its "
+        "matching id."
+    ]
+    for msg in messages:
+        parts.append(f"\n--- id: {msg['id']} ---\n{msg['text']}")
+    prompt = "\n".join(parts)
+
     url = f"{GEMINI_API}/models/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
     payload = {
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {
             "responseMimeType": "application/json",
-            "responseSchema": CLASSIFY_SCHEMA,
+            "responseSchema": BATCH_SCHEMA,
+            "maxOutputTokens": 8192,
         },
     }
 
     max_attempts = 3
     for attempt in range(1, max_attempts + 1):
-        resp = requests.post(url, json=payload, timeout=60)
+        resp = requests.post(url, json=payload, timeout=90)
         if resp.status_code == 429 and attempt < max_attempts:
             wait = 15 * attempt
             log.warning("Gemini rate-limited; retrying in %ds (attempt %d/%d)", wait, attempt, max_attempts)
@@ -161,7 +213,8 @@ def classify_and_translate(source_text: str) -> dict:
         resp.raise_for_status()
         data = resp.json()
         text_block = data["candidates"][0]["content"]["parts"][0]["text"]
-        return json.loads(text_block)
+        parsed = json.loads(text_block)
+        return {item["id"]: item for item in parsed["results"]}
 
 
 def get_telegraph_token(state: dict) -> str:
@@ -251,35 +304,54 @@ def main() -> None:
         log.info("No new messages.")
         return
 
-    posted = 0
+    candidates = []
     for msg in new_messages:
-        time.sleep(3)  # stay comfortably under Gemini's free-tier rate limit
-        try:
-            result = classify_and_translate(msg["text"])
-        except Exception:
-            log.exception("Classification failed for message %s; will retry next run", msg["id"])
-            continue
-
-        if not (result["is_good_news"] and result["is_authentic_and_postable"]):
-            log.info("Skipping %s: %s", msg["id"], result["reason"])
+        if looks_like_ad(msg["text"]):
+            log.info("Pre-filter: skipping %s (looks like an ad)", msg["id"])
             state.setdefault("seen_ids", []).append(msg["id"])
             save_state(state)
-            continue
+        else:
+            candidates.append(msg)
 
+    posted = 0
+    for i in range(0, len(candidates), BATCH_SIZE):
+        batch = candidates[i : i + BATCH_SIZE]
+        time.sleep(3)  # stay comfortably under Gemini's free-tier rate limit
         try:
-            title = result["summary_en"].split(".")[0]
-            telegraph_url = publish_full_translation(
-                state, title, result["full_translation_en"], msg["link"]
-            )
-            send_to_telegram_channel(result["summary_en"], msg["link"], telegraph_url)
+            results = classify_and_translate_batch(batch)
         except Exception:
-            log.exception("Failed to post message %s; will retry next run", msg["id"])
+            log.exception(
+                "Batch classification failed for %s; will retry next run",
+                [m["id"] for m in batch],
+            )
             continue
 
-        log.info("Posted %s -> %s", msg["id"], telegraph_url)
-        posted += 1
-        state.setdefault("seen_ids", []).append(msg["id"])
-        save_state(state)
+        for msg in batch:
+            result = results.get(msg["id"])
+            if result is None:
+                log.warning("No result returned for %s; will retry next run", msg["id"])
+                continue
+
+            if not (result["is_good_news"] and result["is_authentic_and_postable"]):
+                log.info("Skipping %s: %s", msg["id"], result["reason"])
+                state.setdefault("seen_ids", []).append(msg["id"])
+                save_state(state)
+                continue
+
+            try:
+                title = result["summary_en"].split(".")[0]
+                telegraph_url = publish_full_translation(
+                    state, title, result["full_translation_en"], msg["link"]
+                )
+                send_to_telegram_channel(result["summary_en"], msg["link"], telegraph_url)
+            except Exception:
+                log.exception("Failed to post message %s; will retry next run", msg["id"])
+                continue
+
+            log.info("Posted %s -> %s", msg["id"], telegraph_url)
+            posted += 1
+            state.setdefault("seen_ids", []).append(msg["id"])
+            save_state(state)
 
     log.info("Done. Posted %d new good-news item(s).", posted)
 
