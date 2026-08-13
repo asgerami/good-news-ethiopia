@@ -29,6 +29,7 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TARGET_CHAT: ${{ secrets.TARGET_CHAT }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_MODEL: ${{ secrets.GEMINI_MODEL }}
         run: python scraper.py
 
       - name: Persist updated state

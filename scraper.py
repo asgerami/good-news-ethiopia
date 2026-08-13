@@ -1,7 +1,7 @@
 """
 Good News Ethiopia scraper bot.
 
-Scrapes public posts from the Tikvah Ethiopia Telegram channel (via the
+Scrapes public posts from the Tikvah Ethiopia Telegram channels (via the
 no-login t.me/s/<channel> preview page), asks Gemini to judge whether each
 post is genuinely good news, translates + summarizes it into English, and
 posts it to the Good News Ethiopia Telegram channel with:
@@ -17,6 +17,7 @@ import html
 import json
 import logging
 import os
+import time
 from pathlib import Path
 
 import requests
@@ -25,11 +26,15 @@ from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).parent / ".env")
 
-SOURCE_CHANNEL = os.environ.get("SOURCE_CHANNEL", "tikvahethiopia")
+SOURCE_CHANNELS = [
+    c.strip()
+    for c in os.environ.get("SOURCE_CHANNELS", "tikvahethiopia,tikvahethmagazine").split(",")
+    if c.strip()
+]
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 TARGET_CHAT = os.environ["TARGET_CHAT"]
 GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-flash-latest")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-flash-lite-latest")
 MAX_MESSAGES_PER_RUN = int(os.environ.get("MAX_MESSAGES_PER_RUN", "20"))
 MAX_SEEN_IDS = 5000
 
@@ -86,8 +91,14 @@ CLASSIFY_SCHEMA = {
 
 def load_state() -> dict:
     if STATE_FILE.exists():
-        return json.loads(STATE_FILE.read_text())
-    return {"seen_ids": [], "telegraph_access_token": None}
+        state = json.loads(STATE_FILE.read_text())
+    else:
+        state = {"seen_ids": [], "telegraph_access_token": None}
+    # Migrate pre-multi-channel ids (bare numeric strings) to "channel/id" form.
+    state["seen_ids"] = [
+        sid if "/" in sid else f"tikvahethiopia/{sid}" for sid in state.get("seen_ids", [])
+    ]
+    return state
 
 
 def save_state(state: dict) -> None:
@@ -103,10 +114,9 @@ def fetch_source_messages(channel: str) -> list[dict]:
 
     messages = []
     for block in soup.select("div.tgme_widget_message"):
-        post_id = block.get("data-post")
+        post_id = block.get("data-post")  # e.g. "tikvahethiopia/107416" — already unique across channels
         if not post_id:
             continue
-        msg_id = post_id.split("/")[-1]
 
         text_div = block.select_one(".tgme_widget_message_text")
         text = text_div.get_text("\n", strip=True) if text_div else ""
@@ -114,9 +124,9 @@ def fetch_source_messages(channel: str) -> list[dict]:
             continue  # skip photo/video-only posts with no caption
 
         link_tag = block.select_one("a.tgme_widget_message_date")
-        link = link_tag["href"] if link_tag else f"https://t.me/{channel}/{msg_id}"
+        link = link_tag["href"] if link_tag else f"https://t.me/{post_id}"
 
-        messages.append({"id": msg_id, "text": text, "link": link})
+        messages.append({"id": post_id, "text": text, "link": link})
     return messages
 
 
@@ -124,7 +134,7 @@ def classify_and_translate(source_text: str) -> dict:
     prompt = (
         "You help run a 'Good News Ethiopia' Telegram channel that reposts "
         "only genuinely positive news, translated into English, sourced from "
-        "the Tikvah Ethiopia Telegram channel (a trusted Ethiopian news source). "
+        "Tikvah's Telegram channels (a trusted Ethiopian news source). "
         "Given the post below (likely Amharic, possibly mixed with English), "
         "decide whether it is good news, whether it is safe and authentic to "
         "repost as-is (not an ad, not an unverified rumor, not speculation), "
@@ -132,21 +142,26 @@ def classify_and_translate(source_text: str) -> dict:
         "short English summary.\n\n---\n" + source_text
     )
     url = f"{GEMINI_API}/models/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
-    resp = requests.post(
-        url,
-        json={
-            "contents": [{"parts": [{"text": prompt}]}],
-            "generationConfig": {
-                "responseMimeType": "application/json",
-                "responseSchema": CLASSIFY_SCHEMA,
-            },
+    payload = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {
+            "responseMimeType": "application/json",
+            "responseSchema": CLASSIFY_SCHEMA,
         },
-        timeout=60,
-    )
-    resp.raise_for_status()
-    data = resp.json()
-    text_block = data["candidates"][0]["content"]["parts"][0]["text"]
-    return json.loads(text_block)
+    }
+
+    max_attempts = 3
+    for attempt in range(1, max_attempts + 1):
+        resp = requests.post(url, json=payload, timeout=60)
+        if resp.status_code == 429 and attempt < max_attempts:
+            wait = 15 * attempt
+            log.warning("Gemini rate-limited; retrying in %ds (attempt %d/%d)", wait, attempt, max_attempts)
+            time.sleep(wait)
+            continue
+        resp.raise_for_status()
+        data = resp.json()
+        text_block = data["candidates"][0]["content"]["parts"][0]["text"]
+        return json.loads(text_block)
 
 
 def get_telegraph_token(state: dict) -> str:
@@ -198,7 +213,6 @@ def publish_full_translation(state: dict, title: str, full_text: str, original_l
 
 def send_to_telegram_channel(summary_en: str, original_link: str, telegraph_url: str) -> None:
     message = (
-        "\U0001f4f0 <b>Good News from Ethiopia</b>\n\n"
         f"{html.escape(summary_en)}\n\n"
         f'\U0001f517 <a href="{original_link}">Original post (Amharic)</a> — via Tikvah\n'
         f'\U0001f4d6 <a href="{telegraph_url}">Read the full English translation</a>'
@@ -223,9 +237,15 @@ def main() -> None:
     state = load_state()
     seen = set(state.get("seen_ids", []))
 
-    all_messages = fetch_source_messages(SOURCE_CHANNEL)
-    new_messages = [m for m in all_messages if m["id"] not in seen]
-    new_messages = new_messages[-MAX_MESSAGES_PER_RUN:]
+    new_messages = []
+    for channel in SOURCE_CHANNELS:
+        try:
+            channel_messages = fetch_source_messages(channel)
+        except Exception:
+            log.exception("Failed to fetch messages from %s; skipping this run", channel)
+            continue
+        channel_new = [m for m in channel_messages if m["id"] not in seen]
+        new_messages.extend(channel_new[-MAX_MESSAGES_PER_RUN:])
 
     if not new_messages:
         log.info("No new messages.")
@@ -233,6 +253,7 @@ def main() -> None:
 
     posted = 0
     for msg in new_messages:
+        time.sleep(3)  # stay comfortably under Gemini's free-tier rate limit
         try:
             result = classify_and_translate(msg["text"])
         except Exception:
