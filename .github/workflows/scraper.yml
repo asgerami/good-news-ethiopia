@@ -30,6 +30,7 @@ jobs:
           TARGET_CHAT: ${{ secrets.TARGET_CHAT }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           GEMINI_MODEL: ${{ secrets.GEMINI_MODEL }}
+          ADMIN_CHAT_ID: ${{ secrets.ADMIN_CHAT_ID }}
         run: python scraper.py
 
       - name: Persist updated state

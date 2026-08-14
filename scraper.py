@@ -35,6 +35,7 @@ SOURCE_CHANNELS = [
 ]
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 TARGET_CHAT = os.environ["TARGET_CHAT"]
+ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID")
 GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-flash-lite-latest")
 MAX_MESSAGES_PER_RUN = int(os.environ.get("MAX_MESSAGES_PER_RUN", "20"))
@@ -286,6 +287,34 @@ def send_to_telegram_channel(summary_en: str, original_link: str, telegraph_url:
         raise RuntimeError(f"Telegram sendMessage failed: {data}")
 
 
+def notify_admin_of_failure(error: BaseException) -> None:
+    """Best-effort DM to the admin when a run crashes. Never raises itself —
+    a broken alert must not mask the original failure."""
+    if not ADMIN_CHAT_ID:
+        return
+
+    run_url = ""
+    server = os.environ.get("GITHUB_SERVER_URL")
+    repo = os.environ.get("GITHUB_REPOSITORY")
+    run_id = os.environ.get("GITHUB_RUN_ID")
+    if server and repo and run_id:
+        run_url = f"\n\n{server}/{repo}/actions/runs/{run_id}"
+
+    message = (
+        "⚠️ <b>Good News Ethiopia bot crashed</b>\n\n"
+        f"<code>{html.escape(f'{type(error).__name__}: {error}')}</code>"
+        f"{html.escape(run_url) if run_url else ''}"
+    )
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            data={"chat_id": ADMIN_CHAT_ID, "text": message, "parse_mode": "HTML"},
+            timeout=15,
+        )
+    except Exception:
+        log.exception("Failed to send admin failure notification")
+
+
 def main() -> None:
     state = load_state()
     seen = set(state.get("seen_ids", []))
@@ -357,4 +386,9 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        log.exception("Unhandled error; run failed")
+        notify_admin_of_failure(e)
+        raise
