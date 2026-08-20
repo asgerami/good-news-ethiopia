@@ -37,6 +37,28 @@ jobs:
         run: |
           git config user.name "good-news-bot"
           git config user.email "actions@users.noreply.github.com"
+
           git add state.json
-          git diff --cached --quiet || git commit -m "Update state"
-          git push
+          if git diff --cached --quiet; then
+            echo "No state changes to persist."
+            exit 0
+          fi
+          git commit -m "Update state"
+
+          for attempt in 1 2 3 4 5; do
+            if git push; then
+              echo "Pushed on attempt $attempt."
+              exit 0
+            fi
+
+            echo "Push rejected on attempt $attempt — merging with remote state.json"
+            git fetch origin main
+            python3 .github/scripts/merge_state.py
+
+            git add state.json
+            git reset --soft origin/main
+            git diff --cached --quiet || git commit -m "Update state (merged)"
+          done
+
+          echo "Failed to push state after 5 attempts" >&2
+          exit 1
